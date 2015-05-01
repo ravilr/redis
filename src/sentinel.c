@@ -931,10 +931,12 @@ sentinelRedisInstance *createSentinelRedisInstance(char *name, int flags, char *
     else if (flags & SRI_SLAVE) table = master->slaves;
     else if (flags & SRI_SENTINEL) table = master->sentinels;
     sdsname = sdsnew(name);
-    if (dictFind(table,sdsname)) {
-        sdsfree(sdsname);
-        errno = EBUSY;
-        return NULL;
+    if (table != NULL) {
+        if (dictFind(table,sdsname)) {
+            sdsfree(sdsname);
+            errno = EBUSY;
+            return NULL;
+        }
     }
 
     /* Create the instance object. */
@@ -1009,7 +1011,8 @@ sentinelRedisInstance *createSentinelRedisInstance(char *name, int flags, char *
     }
 
     /* Add into the right table. */
-    dictAdd(table, ri->name, ri);
+    if (table != NULL)
+        dictAdd(table, ri->name, ri);
     return ri;
 }
 
@@ -1620,7 +1623,7 @@ void rewriteConfigSentinelOption(struct rewriteConfigState *state) {
             if (sentinelAddrIsEqual(candidate_slave_addr, master_addr))
                 candidate_slave_addr = master->addr;
             line = sdscatprintf(sdsempty(),
-                "sentinel known-candiddate-slave %s %s %d",
+                "sentinel known-candidate-slave %s %s %d",
                 master->name, candidate_slave_addr->ip, candidate_slave_addr->port);
             rewriteConfigRewriteLine(state,"sentinel",line,1);
         }
@@ -1972,13 +1975,12 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
 
         /* role:<role> */
         if (!memcmp(l,"role:master",11)) role = SRI_MASTER;
-        else if (!memcmp(l,"role:slave",10)) {
-            role = SRI_SLAVE;
-            if ((sentinel.monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) && found_slaves)
-                role = SRI_MASTER;
-        }
+        else if (!memcmp(l,"role:slave",10)) role = SRI_SLAVE;
 
-        if (role == SRI_SLAVE) {
+        /* we aren't interested in master info for relay masters even though they are slave */
+        if (role == SRI_SLAVE && 
+           !((sentinel.monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) && (ri->flags & SRI_MASTER)) && 
+           !((sentinel.monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) && (ri->flags & SRI_RELAY_SLAVE))) {
             /* master_host:<host> */
             if (sdslen(l) >= 12 && !memcmp(l,"master_host:",12)) {
                 if (ri->slave_master_host == NULL ||
@@ -2017,7 +2019,9 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
                 ri->slave_repl_offset = strtoull(l+18,NULL,10);
         }
 
-        if ((sentinel.monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) && (role == SRI_MASTER)) {
+        /* master link status for relay masters */
+        if (((sentinel.monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) && (ri->flags & SRI_MASTER)) || 
+           ((sentinel.monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) && (ri->flags & SRI_RELAY_SLAVE))) {
             /* master_link_status:<status> */
             if (sdslen(l) >= 19 && !memcmp(l,"master_link_status:",19)) {
                 ri->slave_master_link_status =
@@ -2027,6 +2031,9 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
             }
         }
     }
+    if ((sentinel.monitor_mode == SENTINEL_MONITOR_RELAY_MASTER || ri->info_refresh == 0) && (found_slaves == 1)) {
+        role = SRI_MASTER;
+    }    
     ri->info_refresh = mstime();
     sdsfreesplitres(lines,numlines);
 
@@ -3156,14 +3163,16 @@ void sentinelCheckSubjectivelyDown(sentinelRedisInstance *ri) {
      * 2) We believe it is a master, it reports to be a slave for enough time
      *    to meet the down_after_period, plus enough time to get two times
      *    INFO report from the instance.
-     * 3) If monitor_relay_master mode, and master_link_status of relay master is down   */
+     * 3) If monitor_relay_master mode, and master_link_status of relay master is down 
+     *    for enough time to meet the down_after_period   */
     if (elapsed > ri->down_after_period ||
         (ri->flags & SRI_MASTER &&
          ri->role_reported == SRI_SLAVE &&
+         sentinel.monitor_mode == SENTINEL_MONITOR_MASTER &&
          mstime() - ri->role_reported_time >
           (ri->down_after_period+SENTINEL_INFO_PERIOD*2)) ||
-         ((sentinel.monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) && ri->flags & SRI_MASTER && ri->slave_master_link_status == SENTINEL_MASTER_LINK_STATUS_DOWN
-          && mstime() - ri->role_reported_time > (ri->down_after_period+SENTINEL_INFO_PERIOD*2)))
+         ((sentinel.monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) && ri->flags & (SRI_MASTER|SRI_RELAY_SLAVE) && ri->slave_master_link_status == SENTINEL_MASTER_LINK_STATUS_DOWN
+          && mstime() - ri->role_reported_time > (ri->down_after_period+SENTINEL_INFO_PERIOD*2) && ri->master_link_down_time > ri->down_after_period))
     {
         /* Is subjectively down */
         if ((ri->flags & SRI_S_DOWN) == 0) {
