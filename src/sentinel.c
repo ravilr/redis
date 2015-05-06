@@ -197,6 +197,7 @@ typedef struct sentinelRedisInstance {
      * are set to NULL no script is executed. */
     char *notification_script;
     char *client_reconfig_script;
+    int monitor_mode;       /* 0 : monitoring real master, 1: monitoring relay master/slave */
 } sentinelRedisInstance;
 
 /* Main state. */
@@ -214,7 +215,6 @@ struct sentinelState {
                                not NULL. */
     int announce_port;      /* Port that is gossiped to other sentinels if
                                non zero. */
-    int monitor_mode;       /* 0 : monitoring real master, 1: monitoring relay master/slave */
 } sentinel;
 
 /* A script execution job. */
@@ -349,6 +349,7 @@ void sentinelFlushConfig(void);
 void sentinelGenerateInitialMonitorEvents(void);
 int sentinelSendPing(sentinelRedisInstance *ri);
 int sentinelForceHelloUpdateForMaster(sentinelRedisInstance *master);
+void sentinelPropagateMonitorMode(sentinelRedisInstance *master);
 
 /* ========================= Dictionary types =============================== */
 
@@ -440,7 +441,6 @@ void initSentinel(void) {
     sentinel.scripts_queue = listCreate();
     sentinel.announce_ip = NULL;
     sentinel.announce_port = 0;
-    sentinel.monitor_mode = SENTINEL_MONITOR_MASTER;
 }
 
 /* This function gets called when the server is in Sentinel mode, started,
@@ -938,6 +938,10 @@ sentinelRedisInstance *createSentinelRedisInstance(char *name, int flags, char *
             return NULL;
         }
     }
+    /* Don't allow adding multiple candidate slave instances. */
+    if ((flags & SRI_RELAY_SLAVE) && (master->candidate_slave != NULL)) {
+        return NULL;
+    } 
 
     /* Create the instance object. */
     ri = zmalloc(sizeof(*ri));
@@ -997,6 +1001,10 @@ sentinelRedisInstance *createSentinelRedisInstance(char *name, int flags, char *
     ri->notification_script = NULL;
     ri->client_reconfig_script = NULL;
 
+    /* Monitor mode. */
+    ri->monitor_mode = master ? master->monitor_mode :
+                       SENTINEL_MONITOR_MASTER;    
+
     /* Role */
     ri->role_reported = ri->flags & (SRI_MASTER|SRI_SLAVE);
     ri->role_reported_time = mstime();
@@ -1007,7 +1015,9 @@ sentinelRedisInstance *createSentinelRedisInstance(char *name, int flags, char *
     {
         ri->master->candidate_slave = ri;
         ri->role_reported = SRI_SLAVE;
-        sentinel.monitor_mode = SENTINEL_MONITOR_RELAY_MASTER;
+        ri->monitor_mode = SENTINEL_MONITOR_RELAY_MASTER;
+        master->monitor_mode = SENTINEL_MONITOR_RELAY_MASTER;
+        sentinelPropagateMonitorMode(master);
     }
 
     /* Add into the right table. */
@@ -1365,6 +1375,24 @@ void sentinelPropagateDownAfterPeriod(sentinelRedisInstance *master) {
         while((de = dictNext(di)) != NULL) {
             sentinelRedisInstance *ri = dictGetVal(de);
             ri->down_after_period = master->down_after_period;
+        }
+        dictReleaseIterator(di);
+    }
+}
+
+/* This function sets the monitor_mode field value in 'master' to all
+ * the slaves and sentinel instances connected to this master. */
+void sentinelPropagateMonitorMode(sentinelRedisInstance *master) {
+    dictIterator *di;
+    dictEntry *de;
+    int j;
+    dict *d[] = {master->slaves, master->sentinels, NULL};
+
+    for (j = 0; d[j]; j++) {
+        di = dictGetIterator(d[j]);
+        while((de = dictNext(di)) != NULL) {
+            sentinelRedisInstance *ri = dictGetVal(de);
+            ri->monitor_mode = master->monitor_mode;
         }
         dictReleaseIterator(di);
     }
@@ -1814,7 +1842,7 @@ void sentinelReconnectInstance(sentinelRedisInstance *ri) {
             sentinelKillLink(ri,ri->pc);
         } else {
             int retval;
-            char *channel = (sentinel.monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) ?
+            char *channel = (ri->monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) ?
                              SENTINEL_HELLO_CHANNEL_RELAY : SENTINEL_HELLO_CHANNEL;
 
             ri->pc_conn_time = mstime();
@@ -1979,8 +2007,8 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
 
         /* we aren't interested in master info for relay masters even though they are slave */
         if (role == SRI_SLAVE && 
-           !((sentinel.monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) && (ri->flags & SRI_MASTER)) && 
-           !((sentinel.monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) && (ri->flags & SRI_RELAY_SLAVE))) {
+           !((ri->monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) && (ri->flags & SRI_MASTER)) && 
+           !((ri->monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) && (ri->flags & SRI_RELAY_SLAVE))) {
             /* master_host:<host> */
             if (sdslen(l) >= 12 && !memcmp(l,"master_host:",12)) {
                 if (ri->slave_master_host == NULL ||
@@ -2020,8 +2048,8 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
         }
 
         /* master link status for relay masters */
-        if (((sentinel.monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) && (ri->flags & SRI_MASTER)) || 
-           ((sentinel.monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) && (ri->flags & SRI_RELAY_SLAVE))) {
+        if (((ri->monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) && (ri->flags & SRI_MASTER)) || 
+           ((ri->monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) && (ri->flags & SRI_RELAY_SLAVE))) {
             /* master_link_status:<status> */
             if (sdslen(l) >= 19 && !memcmp(l,"master_link_status:",19)) {
                 ri->slave_master_link_status =
@@ -2031,7 +2059,7 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
             }
         }
     }
-    if ((sentinel.monitor_mode == SENTINEL_MONITOR_RELAY_MASTER || ri->info_refresh == 0) && (found_slaves == 1)) {
+    if ((ri->monitor_mode == SENTINEL_MONITOR_RELAY_MASTER || ri->info_refresh == 0) && (found_slaves == 1)) {
         role = SRI_MASTER;
     }    
     ri->info_refresh = mstime();
@@ -2123,7 +2151,7 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
         /* in relay master setup, if there is a failover in progress
          * this slave was reconfigured to slave of new master, in which
          * case do not reconfigure to slave of old master */
-        if (sentinel.monitor_mode == SENTINEL_MONITOR_RELAY_MASTER &&
+        if (ri->monitor_mode == SENTINEL_MONITOR_RELAY_MASTER &&
            ri->master->flags & SRI_FAILOVER_IN_PROGRESS &&
            ri->master->failover_state >= SENTINEL_FAILOVER_STATE_RECONF_SLAVES)
             donot_reconf = 1;
@@ -2405,7 +2433,7 @@ int sentinelSendHello(sentinelRedisInstance *ri) {
     }
     announce_port = sentinel.announce_port ?
                     sentinel.announce_port : server.port;
-    char *channel = (sentinel.monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) ?
+    char *channel = (ri->monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) ?
 	                                 SENTINEL_HELLO_CHANNEL_RELAY : SENTINEL_HELLO_CHANNEL;
 
     /* Format and send the Hello message. */
@@ -2681,6 +2709,13 @@ void addReplySentinelRedisInstance(redisClient *c, sentinelRedisInstance *ri) {
             addReplyBulkCString(c,ri->client_reconfig_script);
             fields++;
         }
+         
+        /* if relay_master monitor mode, display candidate slave */
+        if (ri->candidate_slave != NULL) {
+            addReplyBulkCString(c,"candidate-slave");
+            addReplyBulkCString(c,ri->candidate_slave->name);
+            fields++;
+        }   
     }
 
     /* Only slaves */
@@ -2913,6 +2948,38 @@ void sentinelCommand(redisClient *c) {
             sentinelEvent(REDIS_WARNING,"+monitor",ri,"%@ quorum %d",ri->quorum);
             addReply(c,shared.ok);
         }
+    } else if (!strcasecmp(c->argv[1]->ptr,"candidate-slave")) {
+        /* SENTINEL CANDIDATE-SLAVE <name> <ip> <port> */
+        sentinelRedisInstance *ri, *slave;
+        long port;
+        char ip[REDIS_IP_STR_LEN];
+
+        if (c->argc != 5) goto numargserr;
+        ri = sentinelGetMasterByName(c->argv[2]->ptr);
+        if (!ri) {
+            addReplyError(c,"No such master with specified name.");
+            return;
+        }
+        if (getLongFromObjectOrReply(c,c->argv[4],&port,"Invalid port")
+            != REDIS_OK) return;
+        /* Make sure the IP field is actually a valid IP before passing it
+         * to createSentinelRedisInstance(), otherwise we may trigger a
+         * DNS lookup at runtime. */
+        if (anetResolveIP(NULL,c->argv[3]->ptr,ip,sizeof(ip)) == ANET_ERR) {
+            addReplyError(c,"Invalid IP address specified");
+            return;
+        }
+
+        /* Parameters are valid. Try to create the candidate relay slave. */
+        if ((slave = createSentinelRedisInstance(NULL,SRI_RELAY_SLAVE,c->argv[3]->ptr,
+                     port, ri->quorum, ri)) == NULL)
+        {
+            addReplyError(c,"Wrong hostname or port for slave.");
+            return;
+        } else {
+            sentinelFlushConfig();
+            addReply(c, shared.ok);
+        }  
     } else if (!strcasecmp(c->argv[1]->ptr,"remove")) {
         /* SENTINEL REMOVE <name> */
         sentinelRedisInstance *ri;
@@ -3168,10 +3235,10 @@ void sentinelCheckSubjectivelyDown(sentinelRedisInstance *ri) {
     if (elapsed > ri->down_after_period ||
         (ri->flags & SRI_MASTER &&
          ri->role_reported == SRI_SLAVE &&
-         sentinel.monitor_mode == SENTINEL_MONITOR_MASTER &&
+         ri->monitor_mode == SENTINEL_MONITOR_MASTER &&
          mstime() - ri->role_reported_time >
           (ri->down_after_period+SENTINEL_INFO_PERIOD*2)) ||
-         ((sentinel.monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) && ri->flags & (SRI_MASTER|SRI_RELAY_SLAVE) && ri->slave_master_link_status == SENTINEL_MASTER_LINK_STATUS_DOWN
+         ((ri->monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) && ri->flags & (SRI_MASTER|SRI_RELAY_SLAVE) && ri->slave_master_link_status == SENTINEL_MASTER_LINK_STATUS_DOWN
           && mstime() - ri->role_reported_time > (ri->down_after_period+SENTINEL_INFO_PERIOD*2) && ri->master_link_down_time > ri->down_after_period))
     {
         /* Is subjectively down */
@@ -3637,7 +3704,7 @@ sentinelRedisInstance *sentinelSelectSlave(sentinelRedisInstance *master) {
     /* if monitor_relay_master mode, return the explicit
      * candidate_slave as the selected slave, if it is up and
      * its master_link_status is up */
-    if (sentinel.monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) {
+    if (master->monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) {
         sentinelRedisInstance *slave = master->candidate_slave;
         if (!(slave->flags & (SRI_S_DOWN|SRI_O_DOWN|SRI_DISCONNECTED)) &&
              (mstime() - slave->last_avail_time < SENTINEL_PING_PERIOD*5))
@@ -3923,7 +3990,7 @@ void sentinelFailoverStateMachine(sentinelRedisInstance *ri) {
         case SENTINEL_FAILOVER_STATE_SEND_SLAVEOF_NOONE:
 	    /* if monitor_relay_master mode, skip sending slaveof
 	     * no one, directly transition to reconf_slaves state */
-            if (sentinel.monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) {
+            if (ri->monitor_mode == SENTINEL_MONITOR_RELAY_MASTER) {
                  ri->config_epoch = ri->failover_epoch;
                  ri->failover_state = SENTINEL_FAILOVER_STATE_RECONF_SLAVES;
                  ri->failover_state_change_time = mstime();
@@ -4017,7 +4084,7 @@ void sentinelHandleDictOfRedisInstances(dict *instances) {
 
         sentinelHandleRedisInstance(ri);
 	/* monitor the explicit candidate slave */
-        if (sentinel.monitor_mode == SENTINEL_MONITOR_RELAY_MASTER && ri->flags & SRI_MASTER)
+        if (ri->monitor_mode == SENTINEL_MONITOR_RELAY_MASTER && ri->flags & SRI_MASTER)
             sentinelHandleRedisInstance(ri->candidate_slave);
         if (ri->flags & SRI_MASTER) {
             sentinelHandleDictOfRedisInstances(ri->slaves);
