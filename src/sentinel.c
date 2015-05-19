@@ -933,6 +933,7 @@ sentinelRedisInstance *createSentinelRedisInstance(char *name, int flags, char *
     sdsname = sdsnew(name);
     if (table != NULL) {
         if (dictFind(table,sdsname)) {
+            releaseSentinelAddr(addr);
             sdsfree(sdsname);
             errno = EBUSY;
             return NULL;
@@ -940,6 +941,9 @@ sentinelRedisInstance *createSentinelRedisInstance(char *name, int flags, char *
     }
     /* Don't allow adding multiple candidate slave instances. */
     if ((flags & SRI_RELAY_SLAVE) && (master->candidate_slave != NULL)) {
+        releaseSentinelAddr(addr);
+        sdsfree(sdsname);
+        errno = EBUSY;
         return NULL;
     } 
 
@@ -1316,10 +1320,7 @@ int sentinelResetMasterAndChangeAddress(sentinelRedisInstance *master, char *ip,
                         slaves[j]->port, master->quorum, master);
 	}
         releaseSentinelAddr(slaves[j]);
-        if (slave) {
-            sentinelEvent(REDIS_NOTICE,"+slave",slave,"%@");
-            sentinelFlushConfig();
-        }
+        if (slave) sentinelEvent(REDIS_NOTICE,"+slave",slave,"%@");
     }
     zfree(slaves);
 
@@ -1954,6 +1955,7 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
                             atoi(port), ri->quorum, ri)) != NULL)
                 {
                     sentinelEvent(REDIS_NOTICE,"+slave",slave,"%@");
+                    sentinelFlushConfig();
                 }
             }
         /* slaves failover'ed to the other relay master */
@@ -1991,6 +1993,7 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
                             atoi(port), ri->master->quorum, ri->master)) != NULL)
                 {
                     sentinelEvent(REDIS_NOTICE,"+slave",slave,"%@");
+                    sentinelFlushConfig();
                 }
             }
 	}
