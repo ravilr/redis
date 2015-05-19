@@ -1018,6 +1018,7 @@ sentinelRedisInstance *createSentinelRedisInstance(char *name, int flags, char *
         ri->monitor_mode = SENTINEL_MONITOR_RELAY_MASTER;
         master->monitor_mode = SENTINEL_MONITOR_RELAY_MASTER;
         sentinelPropagateMonitorMode(master);
+        sentinelEvent(REDIS_WARNING,"+relay-slave",ri,"%@");
     }
 
     /* Add into the right table. */
